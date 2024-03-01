@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+
+import logging
+import os
+import signal
+import stat
+import sys
+import time
+import warnings
+from functools import lru_cache
+from pathlib import Path
+from pwd import getpwuid
+
+warnings.simplefilter("ignore", UserWarning)
+import click
+import duckdb
+
+logging.basicConfig()
+lg = logging.getLogger('spacewatch')
+lg.setLevel(logging.DEBUG)
+
+
+@lru_cache(512)
+def get_username(uid):
+    """Convert user id to username."""
+    return getpwuid(uid).pw_name
+
+
+@click.group
+def cli():
+    """collect all CLI functions."""
+    pass
+
+
+def get_conn(path, search=True, in_current_path=False):
+    """Get a database connection."""
+    path = Path(path).resolve().absolute()
+
+    if path == Path('/'):
+        raise click.FileError('no db in root I think')
+
+    assert not str(path).endswith('/')
+    dbfile = path / 'spacewatch.db'
+
+    if dbfile.exists():
+        lg.info(f"Using db: {dbfile}")
+        return duckdb.connect(str(dbfile))
+    else:
+        return get_conn(path.parent, search=search)
+
+
+def drop_table(conn, table):
+    """Drop a table."""
+    try:
+        conn.execute(f"select * from {table} limit 1")
+    except duckdb.duckdb.CatalogException:
+        return
+    conn.execute(f"DROP TABLE {table}")
+
+
+def forget_dir(conn, p):
+    """Forget this folder.
+
+    Function actually performing the forget.
+    """
+
+    start = time.time()
+    sql = f'''
+        DELETE FROM files
+        WHERE dirname ^@ '{p}'
+    '''
+    conn.execute(sql).fetchall()
+    runtime = time.time() - start
+    lg.info(f"Forgot {p} in {runtime:.2f}s")  # noqa
+
+
+def human_size(num, suffix='', precision=0):
+    """Convert a number to human readable."""
+    for unit in ("", "K", "M", "G", "T", "P", "E", "Z"):
+        fstr = f"{{num:.{precision}f}}{{unit}}{{suffix}}"
+        if abs(num) < 1024.0:
+            return fstr.format(num=num, unit=unit, suffix=suffix)
+        num /= 1024.0
+    return fstr.format(num=num, unit='', suffix=suffix)
+
+
+def human_delta(seconds):
+    """Convert time delta to human readable."""
+    # Definitions for time units
+    units = [
+        ("y", 86400 * 365),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60), ("s", 1)]
+
+    for suffix, count in units:
+        if seconds >= count:
+            value = seconds // count
+            return f"{int(value)}{suffix}"
+
+    return f"{seconds:.0f}s"
+
+
+def get_files(p, chunksize=1000):
+    """
+    This function recursively walks through a directory and yields
+    chunks of file information.
+
+    Args:
+        p (str): The directory path to start the search.
+        chunksize (int): The number of files to include in each
+                         chunk. Default is 1000.
+
+    Yields:
+        list: A chunk of file information containing directory name,
+              file name, block size, file size, owner, last modified
+              time, and last accessed time.
+    """
+    chunk = []
+    for dirname in Path(p).glob('**'):
+        dirname_str = str(dirname)
+        for filename in dirname.glob('*'):
+            try:
+                s = filename.stat(follow_symlinks=False)
+            except PermissionError:
+                continue
+            if not stat.S_ISREG(s.st_mode):
+                continue
+            rec = [
+                dirname_str,
+                filename.name,
+                s.st_blksize * s.st_blocks,
+                s.st_size,
+                get_username(s.st_uid),
+                int(s.st_mtime),
+                int(s.st_atime) ]
+            chunk.append(rec)
+            if len(chunk) >= chunksize:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+@cli.command
+@click.argument('path', default='.')
+def init(path):
+    """CLI to initialize a database."""
+    dbfile = Path(path).resolve().absolute() \
+            / 'spacewatch.db'
+    if dbfile.exists():
+        raise click.FileError(f'{dbfile} exists - delete first')
+
+    conn = duckdb.connect(str(dbfile))
+
+    drop_table(conn, 'files')
+    conn.execute(
+        """
+        CREATE TABLE files (
+            dirname VARCHAR NOT NULL,
+            filename VARCHAR NOT NULL,
+            filesize_b UBIGINT NOT NULL,
+            filesize UBIGINT NOT NULL,
+            username VARCHAR NOT NULL,
+            mtime UINTEGER NOT NULL,
+            atime UINTEGER NOT NULL);
+        """)
+
+
+def expand_path(path):
+    """ensure fully expanded path."""
+    p = Path(path).expanduser().resolve().absolute()
+    assert not str(p).endswith('/')
+    return p
+
+
+@cli.command
+@click.argument('path', default='.')
+def forget(path):
+    """Forget everything below this [path]."""
+    conn = get_conn(path, search=True)
+    p = expand_path(path)
+    lg.info(f"Forgetting {p}")  # noqa
+    forget_dir(conn, p)
+
+
+@cli.command
+@click.option('-c', '--chunksize', type=int, default=64**2)
+@click.argument('path', default='.')
+def harvest(path, chunksize):
+    """Harvest all files."""
+    import numpy as np
+    import pandas as pd
+
+    p = expand_path(path)
+
+    colnames = [
+        'dirname','filename','filesize_b','filesize',
+        'username','mtime','atime']
+
+    conn = get_conn(path, search=True)
+    forget_dir(conn, p)
+
+    start = time.time()
+
+    no_records = 0
+    for chunk in get_files(p, chunksize=chunksize):
+        no_records += len(chunk)
+        df_chunk = pd.DataFrame(
+            chunk, columns=colnames,)
+
+        df_chunk.to_sql('files', conn, if_exists='append', index=False)
+        runtime = time.time() - start
+
+        recsec = no_records / runtime
+        sys.stdout.write(f"\rt={human_delta(runtime)}, "
+                         f"n={no_records:_g}, "
+                         f"rps={recsec:.1f}"
+                         "                              ")
+        sys.stdout.flush()
+    print(f"\nInjected {no_records} records.")
+
+
+@cli.command
+@click.option('-n', '--no', default=10, type=int)
+@click.option('--size', 'sort_on', flag_value='size', default='size', help='order on size')
+@click.option('--count', 'sort_on', flag_value='count', help='order on no files')
+@click.argument('path', default='.')
+def folders(path, no, sort_on):
+    """Return a list of large folders."""
+    import pandas as pd
+    now = time.time()
+    conn = get_conn(path)
+
+    if sort_on == 'size':
+        sort = 'ORDER BY sum_filesize DESC'
+    else:
+        sort = 'ORDER BY no_files DESC'
+
+    df = pd.read_sql(
+        f"""SELECT dirname,
+                   COUNT(filename) as no_files,
+                   SUM(filesize) as sum_filesize,
+                   MAX(mtime) as max_mtime
+              FROM files
+             GROUP BY dirname
+             {sort}
+             LIMIT {no}""", conn
+    )
+    df['timedelta'] = (now - df['max_mtime']).apply(human_delta)
+    for _, row in df.iterrows():
+        print(f"{human_size(row['sum_filesize'], suffix='B'):>7s} "
+              f"{human_size(row['no_files']):>5s} "
+              f"{row['timedelta']:>7s} "
+              f"{row['dirname']:s}")
+
+
+@cli.command
+@click.option('-n', '--no', default=10, type=int)
+@click.option('-f', '--filter')
+@click.argument('path', default='.')
+def large_files(path, no, filter):
+    import time
+
+    import pandas as pd
+    now = time.time()
+    conn = get_conn(path)
+    wf = ''
+    if filter is not None:
+        wf = f"WHERE filename LIKE '%{filter}%'"
+    df = pd.read_sql(
+        f"""SELECT * FROM files
+            {wf}
+            ORDER BY filesize DESC
+            LIMIT {no}""", conn
+    )
+    df['timedelta'] = (now - df['mtime']).apply(human_delta)
+    for _, row in df.iterrows():
+        print(f"{human_size(row['filesize']):>7s} "
+              f"{row['timedelta']:>7s} "
+              f"{row['dirname']:s}/{row['filename']:s}")
+
+
+@cli.command
+@click.option('-n', '--no', default=10, type=int)
+@click.argument('path', default='.')
+def head(path, no):
+    import pandas as pd
+    conn = get_conn(path)
+
+    df = pd.read_sql(
+        f"""SELECT *
+             FROM files
+            LIMIT {no}""", conn
+    )
+    print(df)
+    #print(df.dtypes)
+    #print(conn.execute(
+    #    """DESCRIBE files""").fetchall())
+
+@cli.command
+def hi():
+    print('hi')
+
+if __name__ == '__main__':
+    cli()
